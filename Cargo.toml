@@ -697,16 +697,16 @@ ui_input = { codegen-units = 1 }
 zed_actions = { codegen-units = 1 }
 
 [profile.release]
-debug = "limited"
+debug = "none"
 lto = "thin"
 codegen-units = 1
 
 [profile.release.package]
-zed = { codegen-units = 16 }
+zed = { codegen-units = 8 }
 
 [profile.release-fast]
 inherits = "release"
-debug = "full"
+debug = "none"
 lto = false
 codegen-units = 16
 
