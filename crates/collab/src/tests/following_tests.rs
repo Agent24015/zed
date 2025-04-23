@@ -6,17 +6,19 @@ use collab_ui::{
     channel_view::ChannelView,
     notifications::project_shared_notification::ProjectSharedNotification,
 };
-use editor::{Editor, ExcerptRange, MultiBuffer};
+use editor::{Editor, MultiBuffer, PathKey};
 use gpui::{
-    point, AppContext as _, BackgroundExecutor, BorrowAppContext, Entity, SharedString,
-    TestAppContext, VisualTestContext,
+    AppContext as _, BackgroundExecutor, BorrowAppContext, Entity, SharedString, TestAppContext,
+    VisualContext, VisualTestContext, point,
 };
 use language::Capability;
 use project::WorktreeSettings;
 use rpc::proto::PeerId;
 use serde_json::json;
 use settings::SettingsStore;
-use workspace::{item::ItemHandle as _, SplitDirection, Workspace};
+use text::{Point, ToPoint};
+use util::{path, test::sample_text};
+use workspace::{SplitDirection, Workspace, item::ItemHandle as _};
 
 use super::TestClient;
 
@@ -50,7 +52,7 @@ async fn test_basic_following(
     client_a
         .fs()
         .insert_tree(
-            "/a",
+            path!("/a"),
             json!({
                 "1.txt": "one\none\none",
                 "2.txt": "two\ntwo\ntwo",
@@ -58,7 +60,7 @@ async fn test_basic_following(
             }),
         )
         .await;
-    let (project_a, worktree_id) = client_a.build_local_project("/a", cx_a).await;
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/a"), cx_a).await;
     active_call_a
         .update(cx_a, |call, cx| call.set_location(Some(&project_a), cx))
         .await
@@ -294,28 +296,25 @@ async fn test_basic_following(
                 .unwrap()
         });
         let mut result = MultiBuffer::new(Capability::ReadWrite);
-        result.push_excerpts(
+        result.set_excerpts_for_path(
+            PathKey::for_buffer(&buffer_a1, cx),
             buffer_a1,
-            [ExcerptRange {
-                context: 0..3,
-                primary: None,
-            }],
+            [Point::row_range(1..2)],
+            1,
             cx,
         );
-        result.push_excerpts(
+        result.set_excerpts_for_path(
+            PathKey::for_buffer(&buffer_a2, cx),
             buffer_a2,
-            [ExcerptRange {
-                context: 4..7,
-                primary: None,
-            }],
+            [Point::row_range(5..6)],
+            1,
             cx,
         );
         result
     });
     let multibuffer_editor_a = workspace_a.update_in(cx_a, |workspace, window, cx| {
-        let editor = cx.new(|cx| {
-            Editor::for_multibuffer(multibuffer_a, Some(project_a.clone()), true, window, cx)
-        });
+        let editor = cx
+            .new(|cx| Editor::for_multibuffer(multibuffer_a, Some(project_a.clone()), window, cx));
         workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
         editor
     });
@@ -436,13 +435,12 @@ async fn test_basic_following(
         editor_a1.item_id()
     );
 
-    // TODO: Re-enable this test once we can replace our swift Livekit SDK with the rust SDK
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         use crate::rpc::RECONNECT_TIMEOUT;
         use gpui::TestScreenCaptureSource;
         use workspace::{
-            dock::{test::TestPanel, DockPosition},
+            dock::{DockPosition, test::TestPanel},
             item::test::TestItem,
             shared_screen::SharedScreen,
         };
@@ -461,8 +459,9 @@ async fn test_basic_following(
                     .update(cx, |room, cx| room.share_screen(cx))
             })
             .await
-            .unwrap(); // This is what breaks
+            .unwrap();
         executor.run_until_parked();
+
         let shared_screen = workspace_a.update(cx_a, |workspace, cx| {
             workspace
                 .active_item(cx)
@@ -571,7 +570,7 @@ async fn test_following_tab_order(
     client_a
         .fs()
         .insert_tree(
-            "/a",
+            path!("/a"),
             json!({
                 "1.txt": "one",
                 "2.txt": "two",
@@ -579,7 +578,7 @@ async fn test_following_tab_order(
             }),
         )
         .await;
-    let (project_a, worktree_id) = client_a.build_local_project("/a", cx_a).await;
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/a"), cx_a).await;
     active_call_a
         .update(cx_a, |call, cx| call.set_location(Some(&project_a), cx))
         .await
@@ -688,7 +687,7 @@ async fn test_peers_following_each_other(cx_a: &mut TestAppContext, cx_b: &mut T
     client_a
         .fs()
         .insert_tree(
-            "/a",
+            path!("/a"),
             json!({
                 "1.txt": "one",
                 "2.txt": "two",
@@ -697,7 +696,7 @@ async fn test_peers_following_each_other(cx_a: &mut TestAppContext, cx_b: &mut T
             }),
         )
         .await;
-    let (project_a, worktree_id) = client_a.build_local_project("/a", cx_a).await;
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/a"), cx_a).await;
     active_call_a
         .update(cx_a, |call, cx| call.set_location(Some(&project_a), cx))
         .await
@@ -1221,7 +1220,7 @@ async fn test_auto_unfollowing(cx_a: &mut TestAppContext, cx_b: &mut TestAppCont
     client_a
         .fs()
         .insert_tree(
-            "/a",
+            path!("/a"),
             json!({
                 "1.txt": "one",
                 "2.txt": "two",
@@ -1229,7 +1228,7 @@ async fn test_auto_unfollowing(cx_a: &mut TestAppContext, cx_b: &mut TestAppCont
             }),
         )
         .await;
-    let (project_a, worktree_id) = client_a.build_local_project("/a", cx_a).await;
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/a"), cx_a).await;
     active_call_a
         .update(cx_a, |call, cx| call.set_location(Some(&project_a), cx))
         .await
@@ -1436,7 +1435,7 @@ async fn test_following_across_workspaces(cx_a: &mut TestAppContext, cx_b: &mut 
     client_a
         .fs()
         .insert_tree(
-            "/a",
+            path!("/a"),
             json!({
                 "w.rs": "",
                 "x.rs": "",
@@ -1447,7 +1446,7 @@ async fn test_following_across_workspaces(cx_a: &mut TestAppContext, cx_b: &mut 
     client_b
         .fs()
         .insert_tree(
-            "/b",
+            path!("/b"),
             json!({
                 "y.rs": "",
                 "z.rs": "",
@@ -1461,8 +1460,8 @@ async fn test_following_across_workspaces(cx_a: &mut TestAppContext, cx_b: &mut 
     let active_call_a = cx_a.read(ActiveCall::global);
     let active_call_b = cx_b.read(ActiveCall::global);
 
-    let (project_a, worktree_id_a) = client_a.build_local_project("/a", cx_a).await;
-    let (project_b, worktree_id_b) = client_b.build_local_project("/b", cx_b).await;
+    let (project_a, worktree_id_a) = client_a.build_local_project(path!("/a"), cx_a).await;
+    let (project_b, worktree_id_b) = client_b.build_local_project(path!("/b"), cx_b).await;
 
     let (workspace_a, cx_a) = client_a.build_workspace(&project_a, cx_a);
     let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
@@ -1719,7 +1718,7 @@ async fn test_following_into_excluded_file(
     client_a
         .fs()
         .insert_tree(
-            "/a",
+            path!("/a"),
             json!({
                 ".git": {
                     "COMMIT_EDITMSG": "write your commit message here",
@@ -1730,7 +1729,7 @@ async fn test_following_into_excluded_file(
             }),
         )
         .await;
-    let (project_a, worktree_id) = client_a.build_local_project("/a", cx_a).await;
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/a"), cx_a).await;
     active_call_a
         .update(cx_a, |call, cx| call.set_location(Some(&project_a), cx))
         .await
@@ -2082,6 +2081,83 @@ async fn share_workspace(
     cx.read(ActiveCall::global)
         .update(cx, |call, cx| call.share_project(project, cx))
         .await
+}
+
+#[gpui::test]
+async fn test_following_after_replacement(cx_a: &mut TestAppContext, cx_b: &mut TestAppContext) {
+    let (_server, client_a, client_b, channel) = TestServer::start2(cx_a, cx_b).await;
+
+    let (workspace, cx_a) = client_a.build_test_workspace(cx_a).await;
+    join_channel(channel, &client_a, cx_a).await.unwrap();
+    share_workspace(&workspace, cx_a).await.unwrap();
+    let buffer = workspace.update(cx_a, |workspace, cx| {
+        workspace.project().update(cx, |project, cx| {
+            project.create_local_buffer(&sample_text(26, 5, 'a'), None, cx)
+        })
+    });
+    let multibuffer = cx_a.new(|cx| {
+        let mut mb = MultiBuffer::new(Capability::ReadWrite);
+        mb.set_excerpts_for_path(
+            PathKey::for_buffer(&buffer, cx),
+            buffer.clone(),
+            [Point::row_range(1..1), Point::row_range(5..5)],
+            1,
+            cx,
+        );
+        mb
+    });
+    let snapshot = buffer.update(cx_a, |buffer, _| buffer.snapshot());
+    let editor: Entity<Editor> = cx_a.new_window_entity(|window, cx| {
+        Editor::for_multibuffer(
+            multibuffer.clone(),
+            Some(workspace.read(cx).project().clone()),
+            window,
+            cx,
+        )
+    });
+    workspace.update_in(cx_a, |workspace, window, cx| {
+        workspace.add_item_to_center(Box::new(editor.clone()) as _, window, cx)
+    });
+    editor.update_in(cx_a, |editor, window, cx| {
+        editor.change_selections(None, window, cx, |s| {
+            s.select_ranges([Point::row_range(4..4)]);
+        })
+    });
+    let positions = editor.update(cx_a, |editor, _| {
+        editor
+            .selections
+            .disjoint_anchor_ranges()
+            .map(|range| range.start.text_anchor.to_point(&snapshot))
+            .collect::<Vec<_>>()
+    });
+    multibuffer.update(cx_a, |multibuffer, cx| {
+        multibuffer.set_excerpts_for_path(
+            PathKey::for_buffer(&buffer, cx),
+            buffer,
+            [Point::row_range(1..5)],
+            1,
+            cx,
+        );
+    });
+
+    let (workspace_b, cx_b) = client_b.join_workspace(channel, cx_b).await;
+    cx_b.run_until_parked();
+    let editor_b = workspace_b
+        .update(cx_b, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<Editor>())
+        })
+        .unwrap();
+
+    let new_positions = editor_b.update(cx_b, |editor, _| {
+        editor
+            .selections
+            .disjoint_anchor_ranges()
+            .map(|range| range.start.text_anchor.to_point(&snapshot))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(positions, new_positions);
 }
 
 #[gpui::test]

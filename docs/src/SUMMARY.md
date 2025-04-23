@@ -4,6 +4,7 @@
 
 - [Getting Started](./getting-started.md)
 - [System Requirements](./system-requirements.md)
+- [Accounts](./accounts.md)
 - [Linux](./linux.md)
 - [Windows](./windows.md)
 - [Telemetry](./telemetry.md)
@@ -75,6 +76,7 @@
 - [CSS](./languages/css.md)
 - [Dart](./languages/dart.md)
 - [Deno](./languages/deno.md)
+- [Diff](./languages/diff.md)
 - [Docker](./languages/docker.md)
 - [Elixir](./languages/elixir.md)
 - [Elm](./languages/elm.md)
@@ -126,6 +128,7 @@
 - [Vue](./languages/vue.md)
 - [XML](./languages/xml.md)
 - [YAML](./languages/yaml.md)
+- [Yara](./languages/yara.md)
 - [Yarn](./languages/yarn.md)
 - [Zig](./languages/zig.md)
 

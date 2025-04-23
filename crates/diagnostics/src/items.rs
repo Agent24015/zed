@@ -6,10 +6,10 @@ use gpui::{
     WeakEntity, Window,
 };
 use language::Diagnostic;
-use ui::{h_flex, prelude::*, Button, ButtonLike, Color, Icon, IconName, Label, Tooltip};
-use workspace::{item::ItemHandle, StatusItemView, ToolbarItemEvent, Workspace};
+use ui::{Button, ButtonLike, Color, Icon, IconName, Label, Tooltip, h_flex, prelude::*};
+use workspace::{StatusItemView, ToolbarItemEvent, Workspace, item::ItemHandle};
 
-use crate::{Deploy, ProjectDiagnosticsEditor};
+use crate::{Deploy, IncludeWarnings, ProjectDiagnosticsEditor};
 
 pub struct DiagnosticIndicator {
     summary: project::DiagnosticSummary,
@@ -94,6 +94,11 @@ impl Render for DiagnosticIndicator {
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(workspace) = this.workspace.upgrade() {
+                            if this.summary.error_count == 0 && this.summary.warning_count > 0 {
+                                cx.update_default_global(
+                                    |show_warnings: &mut IncludeWarnings, _| show_warnings.0 = true,
+                                );
+                            }
                             workspace.update(cx, |workspace, cx| {
                                 ProjectDiagnosticsEditor::deploy(
                                     workspace,
@@ -163,12 +168,12 @@ impl DiagnosticIndicator {
             .map(|entry| entry.diagnostic);
         if new_diagnostic != self.current_diagnostic {
             self.diagnostics_update =
-                cx.spawn_in(window, |diagnostics_indicator, mut cx| async move {
+                cx.spawn_in(window, async move |diagnostics_indicator, cx| {
                     cx.background_executor()
                         .timer(Duration::from_millis(50))
                         .await;
                     diagnostics_indicator
-                        .update(&mut cx, |diagnostics_indicator, cx| {
+                        .update(cx, |diagnostics_indicator, cx| {
                             diagnostics_indicator.current_diagnostic = new_diagnostic;
                             cx.notify();
                         })

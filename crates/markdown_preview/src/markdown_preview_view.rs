@@ -3,25 +3,27 @@ use std::time::Duration;
 use std::{ops::Range, path::PathBuf};
 
 use anyhow::Result;
-use editor::scroll::{Autoscroll, AutoscrollStrategy};
+use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent};
 use gpui::{
-    list, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ListState, ParentElement, Render, Styled, Subscription, Task,
-    WeakEntity, Window,
+    App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ListState, ParentElement, Render, Styled, Subscription, Task, WeakEntity, Window,
+    list,
 };
 use language::LanguageRegistry;
+use settings::Settings;
+use theme::ThemeSettings;
 use ui::prelude::*;
 use workspace::item::{Item, ItemHandle};
 use workspace::{Pane, Workspace};
 
-use crate::markdown_elements::ParsedMarkdownElement;
 use crate::OpenPreviewToTheSide;
+use crate::markdown_elements::ParsedMarkdownElement;
 use crate::{
+    OpenPreview,
     markdown_elements::ParsedMarkdown,
     markdown_parser::parse_markdown,
-    markdown_renderer::{render_markdown_block, RenderContext},
-    OpenPreview,
+    markdown_renderer::{RenderContext, render_markdown_block},
 };
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -185,6 +187,7 @@ impl MarkdownPreviewView {
                                             })
                                         }
                                     });
+
                             let block = contents.children.get(ix).unwrap();
                             let rendered_block = render_markdown_block(block, &mut render_cx);
 
@@ -195,7 +198,9 @@ impl MarkdownPreviewView {
 
                             div()
                                 .id(ix)
-                                .when(should_apply_padding, |this| this.pb_3())
+                                .when(should_apply_padding, |this| {
+                                    this.pb(render_cx.scaled_rems(0.75))
+                                })
                                 .group("markdown-block")
                                 .on_click(cx.listener(
                                     move |this, event: &ClickEvent, window, cx| {
@@ -234,7 +239,11 @@ impl MarkdownPreviewView {
                                     container.child(
                                         div()
                                             .relative()
-                                            .child(div().pl_4().child(rendered_block))
+                                            .child(
+                                                div()
+                                                    .pl(render_cx.scaled_rems(1.0))
+                                                    .child(rendered_block),
+                                            )
                                             .child(indicator.absolute().left_0().top_0()),
                                     )
                                 })
@@ -372,13 +381,13 @@ impl MarkdownPreviewView {
     ) -> Task<Result<()>> {
         let language_registry = self.language_registry.clone();
 
-        cx.spawn_in(window, move |view, mut cx| async move {
+        cx.spawn_in(window, async move |view, cx| {
             if wait_for_debounce {
                 // Wait for the user to stop typing
                 cx.background_executor().timer(REPARSE_DEBOUNCE).await;
             }
 
-            let (contents, file_location) = view.update(&mut cx, |_, cx| {
+            let (contents, file_location) = view.update(cx, |_, cx| {
                 let editor = editor.read(cx);
                 let contents = editor.buffer().read(cx).snapshot(cx).text();
                 let file_location = MarkdownPreviewView::get_folder_for_active_editor(editor, cx);
@@ -389,7 +398,7 @@ impl MarkdownPreviewView {
                 parse_markdown(&contents, file_location, Some(language_registry)).await
             });
             let contents = parsing_task.await;
-            view.update(&mut cx, move |view, cx| {
+            view.update(cx, move |view, cx| {
                 let markdown_blocks_count = contents.children.len();
                 view.contents = Some(contents);
                 let scroll_top = view.list_state.logical_scroll_top();
@@ -408,12 +417,9 @@ impl MarkdownPreviewView {
     ) {
         if let Some(state) = &self.active_editor {
             state.editor.update(cx, |editor, cx| {
-                editor.change_selections(
-                    Some(Autoscroll::Strategy(AutoscrollStrategy::Center)),
-                    window,
-                    cx,
-                    |selections| selections.select_ranges(vec![selection]),
-                );
+                editor.change_selections(Some(Autoscroll::center()), window, cx, |selections| {
+                    selections.select_ranges(vec![selection])
+                });
                 window.focus(&editor.focus_handle(cx));
             });
         }
@@ -507,6 +513,8 @@ impl Item for MarkdownPreviewView {
 
 impl Render for MarkdownPreviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let buffer_size = ThemeSettings::get_global(cx).buffer_font_size(cx);
+        let buffer_line_height = ThemeSettings::get_global(cx).buffer_line_height;
         v_flex()
             .id("MarkdownPreview")
             .key_context("MarkdownPreview")
@@ -514,6 +522,8 @@ impl Render for MarkdownPreviewView {
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .p_4()
+            .text_size(buffer_size)
+            .line_height(relative(buffer_line_height.value()))
             .child(
                 div()
                     .flex_grow()

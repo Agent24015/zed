@@ -1,20 +1,21 @@
-use crate::{seal::Sealed, App, AppContext, VisualContext, Window};
-use anyhow::{anyhow, Result};
+use crate::{App, AppContext, VisualContext, Window, seal::Sealed};
+use anyhow::{Result, anyhow};
 use collections::FxHashSet;
 use derive_more::{Deref, DerefMut};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use slotmap::{KeyData, SecondaryMap, SlotMap};
 use std::{
-    any::{type_name, Any, TypeId},
+    any::{Any, TypeId, type_name},
     cell::RefCell,
+    cmp::Ordering,
     fmt::{self, Display},
     hash::{Hash, Hasher},
     marker::PhantomData,
     mem,
     num::NonZeroU64,
     sync::{
-        atomic::{AtomicUsize, Ordering::SeqCst},
         Arc, Weak,
+        atomic::{AtomicUsize, Ordering::SeqCst},
     },
     thread::panicking,
 };
@@ -350,6 +351,18 @@ impl PartialEq for AnyEntity {
 
 impl Eq for AnyEntity {}
 
+impl Ord for AnyEntity {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.entity_id.cmp(&other.entity_id)
+    }
+}
+
+impl PartialOrd for AnyEntity {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl std::fmt::Debug for AnyEntity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AnyEntity")
@@ -396,17 +409,6 @@ impl<T: 'static> Entity<T> {
         }
     }
 
-    /// Upgrade the given weak pointer to a retaining pointer, if it still exists
-    pub fn upgrade_from(weak: &WeakEntity<T>) -> Option<Self>
-    where
-        Self: Sized,
-    {
-        Some(Entity {
-            any_entity: weak.any_entity.upgrade()?,
-            entity_type: weak.entity_type,
-        })
-    }
-
     /// Convert this into a dynamically typed entity.
     pub fn into_any(self) -> AnyEntity {
         self.any_entity
@@ -427,32 +429,22 @@ impl<T: 'static> Entity<T> {
     }
 
     /// Updates the entity referenced by this handle with the given function.
-    ///
-    /// The update function receives a context appropriate for its environment.
-    /// When updating in an `App`, it receives a `Context`.
-    /// When updating in a `Window`, it receives a `Window` and a `Context`.
-    pub fn update<C, R>(
+    pub fn update<R, C: AppContext>(
         &self,
         cx: &mut C,
-        update: impl FnOnce(&mut T, &mut Context<'_, T>) -> R,
-    ) -> C::Result<R>
-    where
-        C: AppContext,
-    {
+        update: impl FnOnce(&mut T, &mut Context<T>) -> R,
+    ) -> C::Result<R> {
         cx.update_entity(self, update)
     }
 
     /// Updates the entity referenced by this handle with the given function if
     /// the referenced entity still exists, within a visual context that has a window.
     /// Returns an error if the entity has been released.
-    pub fn update_in<C, R>(
+    pub fn update_in<R, C: VisualContext>(
         &self,
         cx: &mut C,
-        update: impl FnOnce(&mut T, &mut Window, &mut Context<'_, T>) -> R,
-    ) -> C::Result<R>
-    where
-        C: VisualContext,
-    {
+        update: impl FnOnce(&mut T, &mut Window, &mut Context<T>) -> R,
+    ) -> C::Result<R> {
         cx.update_window_entity(self, update)
     }
 }
@@ -492,6 +484,18 @@ impl<T> Eq for Entity<T> {}
 impl<T> PartialEq<WeakEntity<T>> for Entity<T> {
     fn eq(&self, other: &WeakEntity<T>) -> bool {
         self.any_entity.entity_id() == other.entity_id()
+    }
+}
+
+impl<T: 'static> Ord for Entity<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.entity_id().cmp(&other.entity_id())
+    }
+}
+
+impl<T: 'static> PartialOrd for Entity<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -599,6 +603,18 @@ impl PartialEq for AnyWeakEntity {
 
 impl Eq for AnyWeakEntity {}
 
+impl Ord for AnyWeakEntity {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.entity_id.cmp(&other.entity_id)
+    }
+}
+
+impl PartialOrd for AnyWeakEntity {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// A weak reference to a entity of the given type.
 #[derive(Deref, DerefMut)]
 pub struct WeakEntity<T> {
@@ -632,8 +648,10 @@ impl<T> Clone for WeakEntity<T> {
 impl<T: 'static> WeakEntity<T> {
     /// Upgrade this weak entity reference into a strong entity reference
     pub fn upgrade(&self) -> Option<Entity<T>> {
-        // Delegate to the trait implementation to keep behavior in one place.
-        Entity::upgrade_from(self)
+        Some(Entity {
+            any_entity: self.any_entity.upgrade()?,
+            entity_type: self.entity_type,
+        })
     }
 
     /// Updates the entity referenced by this handle with the given function if
@@ -642,7 +660,7 @@ impl<T: 'static> WeakEntity<T> {
     pub fn update<C, R>(
         &self,
         cx: &mut C,
-        update: impl FnOnce(&mut T, &mut Context<'_, T>) -> R,
+        update: impl FnOnce(&mut T, &mut Context<T>) -> R,
     ) -> Result<R>
     where
         C: AppContext,
@@ -661,7 +679,7 @@ impl<T: 'static> WeakEntity<T> {
     pub fn update_in<C, R>(
         &self,
         cx: &mut C,
-        update: impl FnOnce(&mut T, &mut Window, &mut Context<'_, T>) -> R,
+        update: impl FnOnce(&mut T, &mut Window, &mut Context<T>) -> R,
     ) -> Result<R>
     where
         C: VisualContext,
@@ -708,6 +726,18 @@ impl<T> Eq for WeakEntity<T> {}
 impl<T> PartialEq<Entity<T>> for WeakEntity<T> {
     fn eq(&self, other: &Entity<T>) -> bool {
         self.entity_id() == other.any_entity.entity_id()
+    }
+}
+
+impl<T: 'static> Ord for WeakEntity<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.entity_id().cmp(&other.entity_id())
+    }
+}
+
+impl<T: 'static> PartialOrd for WeakEntity<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 

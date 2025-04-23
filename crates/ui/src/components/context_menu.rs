@@ -1,10 +1,10 @@
 use crate::{
-    h_flex, prelude::*, utils::WithRemSize, v_flex, Icon, IconName, IconSize, KeyBinding, Label,
-    List, ListItem, ListSeparator, ListSubHeader,
+    Icon, IconName, IconSize, KeyBinding, Label, List, ListItem, ListSeparator, ListSubHeader,
+    h_flex, prelude::*, utils::WithRemSize, v_flex,
 };
 use gpui::{
-    px, Action, AnyElement, App, AppContext as _, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, Render, Subscription,
+    Action, AnyElement, App, AppContext as _, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, IntoElement, Render, Subscription, px,
 };
 use menu::{SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use settings::Settings;
@@ -126,6 +126,7 @@ impl From<ContextMenuEntry> for ContextMenuItem {
 }
 
 pub struct ContextMenu {
+    builder: Option<Rc<dyn Fn(Self, &mut Window, &mut Context<Self>) -> Self>>,
     items: Vec<ContextMenuItem>,
     focus_handle: FocusHandle,
     action_context: Option<FocusHandle>,
@@ -134,6 +135,7 @@ pub struct ContextMenu {
     clicked: bool,
     _on_blur_subscription: Subscription,
     keep_open_on_confirm: bool,
+    eager: bool,
     documentation_aside: Option<(usize, Rc<dyn Fn(&mut App) -> AnyElement>)>,
 }
 
@@ -163,6 +165,7 @@ impl ContextMenu {
             window.refresh();
             f(
                 Self {
+                    builder: None,
                     items: Default::default(),
                     focus_handle,
                     action_context: None,
@@ -171,12 +174,127 @@ impl ContextMenu {
                     clicked: false,
                     _on_blur_subscription,
                     keep_open_on_confirm: false,
+                    eager: false,
                     documentation_aside: None,
                 },
                 window,
                 cx,
             )
         })
+    }
+
+    /// Builds a [`ContextMenu`] that will stay open when making changes instead of closing after each confirmation.
+    ///
+    /// The main difference from [`ContextMenu::build`] is the type of the `builder`, as we need to be able to hold onto
+    /// it to call it again.
+    pub fn build_persistent(
+        window: &mut Window,
+        cx: &mut App,
+        builder: impl Fn(Self, &mut Window, &mut Context<Self>) -> Self + 'static,
+    ) -> Entity<Self> {
+        cx.new(|cx| {
+            let builder = Rc::new(builder);
+
+            let focus_handle = cx.focus_handle();
+            let _on_blur_subscription = cx.on_blur(
+                &focus_handle,
+                window,
+                |this: &mut ContextMenu, window, cx| this.cancel(&menu::Cancel, window, cx),
+            );
+            window.refresh();
+
+            (builder.clone())(
+                Self {
+                    builder: Some(builder),
+                    items: Default::default(),
+                    focus_handle,
+                    action_context: None,
+                    selected_index: None,
+                    delayed: false,
+                    clicked: false,
+                    _on_blur_subscription,
+                    keep_open_on_confirm: true,
+                    eager: false,
+                    documentation_aside: None,
+                },
+                window,
+                cx,
+            )
+        })
+    }
+
+    pub fn build_eager(
+        window: &mut Window,
+        cx: &mut App,
+        f: impl FnOnce(Self, &mut Window, &mut Context<Self>) -> Self,
+    ) -> Entity<Self> {
+        cx.new(|cx| {
+            let focus_handle = cx.focus_handle();
+            let _on_blur_subscription = cx.on_blur(
+                &focus_handle,
+                window,
+                |this: &mut ContextMenu, window, cx| this.cancel(&menu::Cancel, window, cx),
+            );
+            window.refresh();
+            f(
+                Self {
+                    builder: None,
+                    items: Default::default(),
+                    focus_handle,
+                    action_context: None,
+                    selected_index: None,
+                    delayed: false,
+                    clicked: false,
+                    _on_blur_subscription,
+                    keep_open_on_confirm: false,
+                    eager: true,
+                    documentation_aside: None,
+                },
+                window,
+                cx,
+            )
+        })
+    }
+
+    /// Rebuilds the menu.
+    ///
+    /// This is used to refresh the menu entries when entries are toggled when the menu is configured with
+    /// `keep_open_on_confirm = true`.
+    ///
+    /// This only works if the [`ContextMenu`] was constructed using [`ContextMenu::build_persistent`]. Otherwise it is
+    /// a no-op.
+    fn rebuild(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(builder) = self.builder.clone() else {
+            return;
+        };
+
+        // The way we rebuild the menu is a bit of a hack.
+        let focus_handle = cx.focus_handle();
+        let new_menu = (builder.clone())(
+            Self {
+                builder: Some(builder),
+                items: Default::default(),
+                focus_handle: focus_handle.clone(),
+                action_context: None,
+                selected_index: None,
+                delayed: false,
+                clicked: false,
+                _on_blur_subscription: cx.on_blur(
+                    &focus_handle,
+                    window,
+                    |this: &mut ContextMenu, window, cx| this.cancel(&menu::Cancel, window, cx),
+                ),
+                keep_open_on_confirm: false,
+                eager: false,
+                documentation_aside: None,
+            },
+            window,
+            cx,
+        );
+
+        self.items = new_menu.items;
+
+        cx.notify();
     }
 
     pub fn context(mut self, focus: FocusHandle) -> Self {
@@ -354,12 +472,17 @@ impl ContextMenu {
                 ..
             })
             | ContextMenuItem::CustomEntry { handler, .. },
-        ) = self.selected_index.and_then(|ix| self.items.get(ix))
+        ) = self
+            .selected_index
+            .and_then(|ix| self.items.get(ix))
+            .filter(|_| !self.eager)
         {
             (handler)(context, window, cx)
         }
 
-        if !self.keep_open_on_confirm {
+        if self.keep_open_on_confirm {
+            self.rebuild(window, cx);
+        } else {
             cx.emit(DismissEvent);
         }
     }
@@ -369,24 +492,24 @@ impl ContextMenu {
         cx.emit(DismissEvent);
     }
 
-    fn select_first(&mut self, _: &SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_first(&mut self, _: &SelectFirst, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.items.iter().position(|item| item.is_selectable()) {
-            self.select_index(ix);
+            self.select_index(ix, window, cx);
         }
         cx.notify();
     }
 
-    pub fn select_last(&mut self) -> Option<usize> {
+    pub fn select_last(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
         for (ix, item) in self.items.iter().enumerate().rev() {
             if item.is_selectable() {
-                return self.select_index(ix);
+                return self.select_index(ix, window, cx);
             }
         }
         None
     }
 
-    fn handle_select_last(&mut self, _: &SelectLast, _: &mut Window, cx: &mut Context<Self>) {
-        if self.select_last().is_some() {
+    fn handle_select_last(&mut self, _: &SelectLast, window: &mut Window, cx: &mut Context<Self>) {
+        if self.select_last(window, cx).is_some() {
             cx.notify();
         }
     }
@@ -399,7 +522,7 @@ impl ContextMenu {
             } else {
                 for (ix, item) in self.items.iter().enumerate().skip(next_index) {
                     if item.is_selectable() {
-                        self.select_index(ix);
+                        self.select_index(ix, window, cx);
                         cx.notify();
                         break;
                     }
@@ -422,7 +545,7 @@ impl ContextMenu {
             } else {
                 for (ix, item) in self.items.iter().enumerate().take(ix).rev() {
                     if item.is_selectable() {
-                        self.select_index(ix);
+                        self.select_index(ix, window, cx);
                         cx.notify();
                         break;
                     }
@@ -433,7 +556,13 @@ impl ContextMenu {
         }
     }
 
-    fn select_index(&mut self, ix: usize) -> Option<usize> {
+    fn select_index(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let context = self.action_context.as_ref();
         self.documentation_aside = None;
         let item = self.items.get(ix)?;
         if item.is_selectable() {
@@ -441,6 +570,9 @@ impl ContextMenu {
             if let ContextMenuItem::Entry(entry) = item {
                 if let Some(callback) = &entry.documentation_aside {
                     self.documentation_aside = Some((ix, callback.clone()));
+                }
+                if self.eager && !entry.disabled {
+                    (entry.handler)(context, window, cx)
                 }
             }
         }
@@ -470,11 +602,11 @@ impl ContextMenu {
                 false
             }
         }) {
-            self.select_index(ix);
+            self.select_index(ix, window, cx);
             self.delayed = true;
             cx.notify();
             let action = dispatched.boxed_clone();
-            cx.spawn_in(window, |this, mut cx| async move {
+            cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_millis(50))
                     .await;
@@ -502,7 +634,7 @@ impl ContextMenu {
         item: &ContextMenuItem,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         match item {
             ContextMenuItem::Separator => ListSeparator.into_any_element(),
             ContextMenuItem::Header(header) => ListSubHeader::new(header.clone())
@@ -535,11 +667,17 @@ impl ContextMenu {
                     .when(selectable, |item| {
                         item.on_click({
                             let context = self.action_context.clone();
+                            let keep_open_on_confirm = self.keep_open_on_confirm;
                             move |_, window, cx| {
                                 handler(context.as_ref(), window, cx);
                                 menu.update(cx, |menu, cx| {
                                     menu.clicked = true;
-                                    cx.emit(DismissEvent);
+
+                                    if keep_open_on_confirm {
+                                        menu.rebuild(window, cx);
+                                    } else {
+                                        cx.emit(DismissEvent);
+                                    }
                                 })
                                 .ok();
                             }
@@ -663,7 +801,7 @@ impl ContextMenu {
                                         KeyBinding::for_action(&**action, window, cx)
                                     })
                                     .map(|binding| {
-                                        div().ml_4().child(binding).when(
+                                        div().ml_4().child(binding.disabled(*disabled)).when(
                                             *disabled && documentation_aside_callback.is_some(),
                                             |parent| parent.invisible(),
                                         )
@@ -682,11 +820,16 @@ impl ContextMenu {
                     )
                     .on_click({
                         let context = self.action_context.clone();
+                        let keep_open_on_confirm = self.keep_open_on_confirm;
                         move |_, window, cx| {
                             handler(context.as_ref(), window, cx);
                             menu.update(cx, |menu, cx| {
                                 menu.clicked = true;
-                                cx.emit(DismissEvent);
+                                if keep_open_on_confirm {
+                                    menu.rebuild(window, cx);
+                                } else {
+                                    cx.emit(DismissEvent);
+                                }
                             })
                             .ok();
                         }

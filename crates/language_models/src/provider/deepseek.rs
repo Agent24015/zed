@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use collections::BTreeMap;
 use credentials_provider::CredentialsProvider;
 use editor::{Editor, EditorElement, EditorStyle};
-use futures::{future::BoxFuture, stream::BoxStream, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use gpui::{
     AnyView, AppContext as _, AsyncApp, Entity, FontStyle, Subscription, Task, TextStyle,
     WhiteSpace,
@@ -18,10 +18,10 @@ use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
 use std::sync::Arc;
 use theme::ThemeSettings;
-use ui::{prelude::*, Icon, IconName, List};
+use ui::{Icon, IconName, List, prelude::*};
 use util::ResultExt;
 
-use crate::{ui::InstructionListItem, AllLanguageModelSettings};
+use crate::{AllLanguageModelSettings, ui::InstructionListItem};
 
 const PROVIDER_ID: &str = "deepseek";
 const PROVIDER_NAME: &str = "DeepSeek";
@@ -63,12 +63,12 @@ impl State {
             .deepseek
             .api_url
             .clone();
-        cx.spawn(|this, mut cx| async move {
+        cx.spawn(async move |this, cx| {
             credentials_provider
                 .delete_credentials(&api_url, &cx)
                 .await
                 .log_err();
-            this.update(&mut cx, |this, cx| {
+            this.update(cx, |this, cx| {
                 this.api_key = None;
                 this.api_key_from_env = false;
                 cx.notify();
@@ -82,11 +82,11 @@ impl State {
             .deepseek
             .api_url
             .clone();
-        cx.spawn(|this, mut cx| async move {
+        cx.spawn(async move |this, cx| {
             credentials_provider
                 .write_credentials(&api_url, "Bearer", api_key.as_bytes(), &cx)
                 .await?;
-            this.update(&mut cx, |this, cx| {
+            this.update(cx, |this, cx| {
                 this.api_key = Some(api_key);
                 cx.notify();
             })
@@ -103,7 +103,7 @@ impl State {
             .deepseek
             .api_url
             .clone();
-        cx.spawn(|this, mut cx| async move {
+        cx.spawn(async move |this, cx| {
             let (api_key, from_env) = if let Ok(api_key) = std::env::var(DEEPSEEK_API_KEY_VAR) {
                 (api_key, true)
             } else {
@@ -117,7 +117,7 @@ impl State {
                 )
             };
 
-            this.update(&mut cx, |this, cx| {
+            this.update(cx, |this, cx| {
                 this.api_key = Some(api_key);
                 this.api_key_from_env = from_env;
                 cx.notify();
@@ -139,6 +139,16 @@ impl DeepSeekLanguageModelProvider {
         });
 
         Self { http_client, state }
+    }
+
+    fn create_language_model(&self, model: deepseek::Model) -> Arc<dyn LanguageModel> {
+        Arc::new(DeepSeekLanguageModel {
+            id: LanguageModelId::from(model.id().to_string()),
+            model,
+            state: self.state.clone(),
+            http_client: self.http_client.clone(),
+            request_limiter: RateLimiter::new(4),
+        }) as Arc<dyn LanguageModel>
     }
 }
 
@@ -164,14 +174,11 @@ impl LanguageModelProvider for DeepSeekLanguageModelProvider {
     }
 
     fn default_model(&self, _cx: &App) -> Option<Arc<dyn LanguageModel>> {
-        let model = deepseek::Model::Chat;
-        Some(Arc::new(DeepSeekLanguageModel {
-            id: LanguageModelId::from(model.id().to_string()),
-            model,
-            state: self.state.clone(),
-            http_client: self.http_client.clone(),
-            request_limiter: RateLimiter::new(4),
-        }))
+        Some(self.create_language_model(deepseek::Model::default()))
+    }
+
+    fn default_fast_model(&self, _cx: &App) -> Option<Arc<dyn LanguageModel>> {
+        Some(self.create_language_model(deepseek::Model::default_fast()))
     }
 
     fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
@@ -198,15 +205,7 @@ impl LanguageModelProvider for DeepSeekLanguageModelProvider {
 
         models
             .into_values()
-            .map(|model| {
-                Arc::new(DeepSeekLanguageModel {
-                    id: LanguageModelId::from(model.id().to_string()),
-                    model,
-                    state: self.state.clone(),
-                    http_client: self.http_client.clone(),
-                    request_limiter: RateLimiter::new(4),
-                }) as Arc<dyn LanguageModel>
-            })
+            .map(|model| self.create_language_model(model))
             .collect()
     }
 
@@ -277,6 +276,10 @@ impl LanguageModel for DeepSeekLanguageModel {
 
     fn provider_name(&self) -> LanguageModelProviderName {
         LanguageModelProviderName(PROVIDER_NAME.into())
+    }
+
+    fn supports_tools(&self) -> bool {
+        false
     }
 
     fn telemetry_id(&self) -> String {
@@ -351,61 +354,6 @@ impl LanguageModel for DeepSeekLanguageModel {
                 .boxed())
         }
         .boxed()
-    }
-
-    fn use_any_tool(
-        &self,
-        request: LanguageModelRequest,
-        name: String,
-        description: String,
-        schema: serde_json::Value,
-        cx: &AsyncApp,
-    ) -> BoxFuture<'static, Result<futures::stream::BoxStream<'static, Result<String>>>> {
-        let mut deepseek_request = into_deepseek(
-            request,
-            self.model.id().to_string(),
-            self.max_output_tokens(),
-        );
-
-        deepseek_request.tools = vec![deepseek::ToolDefinition::Function {
-            function: deepseek::FunctionDefinition {
-                name: name.clone(),
-                description: Some(description),
-                parameters: Some(schema),
-            },
-        }];
-
-        let response_stream = self.stream_completion(deepseek_request, cx);
-
-        self.request_limiter
-            .run(async move {
-                let stream = response_stream.await?;
-
-                let tool_args_stream = stream
-                    .filter_map(move |response| async move {
-                        match response {
-                            Ok(response) => {
-                                for choice in response.choices {
-                                    if let Some(tool_calls) = choice.delta.tool_calls {
-                                        for tool_call in tool_calls {
-                                            if let Some(function) = tool_call.function {
-                                                if let Some(args) = function.arguments {
-                                                    return Some(Ok(args));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                None
-                            }
-                            Err(e) => Some(Err(e)),
-                        }
-                    })
-                    .boxed();
-
-                Ok(tool_args_stream)
-            })
-            .boxed()
     }
 }
 
@@ -517,15 +465,15 @@ impl ConfigurationView {
 
         let load_credentials_task = Some(cx.spawn({
             let state = state.clone();
-            |this, mut cx| async move {
+            async move |this, cx| {
                 if let Some(task) = state
-                    .update(&mut cx, |state, cx| state.authenticate(cx))
+                    .update(cx, |state, cx| state.authenticate(cx))
                     .log_err()
                 {
                     let _ = task.await;
                 }
 
-                this.update(&mut cx, |this, cx| {
+                this.update(cx, |this, cx| {
                     this.load_credentials_task = None;
                     cx.notify();
                 })
@@ -547,9 +495,9 @@ impl ConfigurationView {
         }
 
         let state = self.state.clone();
-        cx.spawn(|_, mut cx| async move {
+        cx.spawn(async move |_, cx| {
             state
-                .update(&mut cx, |state, cx| state.set_api_key(api_key, cx))?
+                .update(cx, |state, cx| state.set_api_key(api_key, cx))?
                 .await
         })
         .detach_and_log_err(cx);
@@ -562,12 +510,8 @@ impl ConfigurationView {
             .update(cx, |editor, cx| editor.set_text("", window, cx));
 
         let state = self.state.clone();
-        cx.spawn(|_, mut cx| async move {
-            state
-                .update(&mut cx, |state, cx| state.reset_api_key(cx))?
-                .await
-        })
-        .detach_and_log_err(cx);
+        cx.spawn(async move |_, cx| state.update(cx, |state, cx| state.reset_api_key(cx))?.await)
+            .detach_and_log_err(cx);
 
         cx.notify();
     }
@@ -635,7 +579,7 @@ impl Render for ConfigurationView {
                         .py_1()
                         .bg(cx.theme().colors().editor_background)
                         .border_1()
-                        .border_color(cx.theme().colors().border_variant)
+                        .border_color(cx.theme().colors().border)
                         .rounded_sm()
                         .child(self.render_api_key_editor(cx)),
                 )
@@ -650,8 +594,13 @@ impl Render for ConfigurationView {
                 .into_any()
         } else {
             h_flex()
-                .size_full()
+                .mt_1()
+                .p_1()
                 .justify_between()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().background)
                 .child(
                     h_flex()
                         .gap_1()
@@ -663,8 +612,11 @@ impl Render for ConfigurationView {
                         })),
                 )
                 .child(
-                    Button::new("reset-key", "Reset")
-                        .icon(IconName::Trash)
+                    Button::new("reset-key", "Reset Key")
+                        .label_size(LabelSize::Small)
+                        .icon(Some(IconName::Trash))
+                        .icon_size(IconSize::Small)
+                        .icon_position(IconPosition::Start)
                         .disabled(env_var_set)
                         .on_click(
                             cx.listener(|this, _, window, cx| this.reset_api_key(window, cx)),

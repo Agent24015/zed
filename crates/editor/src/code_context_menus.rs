@@ -1,34 +1,36 @@
+use feature_flags::{Debugger, FeatureFlagAppExt as _};
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
-    div, px, uniform_list, AnyElement, BackgroundExecutor, Div, Entity, Focusable, FontWeight,
-    ListSizingBehavior, ScrollStrategy, SharedString, Size, StrikethroughStyle, StyledText,
-    UniformListScrollHandle,
+    AnyElement, BackgroundExecutor, Entity, Focusable, FontWeight, ListSizingBehavior,
+    ScrollStrategy, SharedString, Size, StrikethroughStyle, StyledText, UniformListScrollHandle,
+    div, px, uniform_list,
 };
 use language::Buffer;
 use language::CodeLabel;
-use markdown::Markdown;
+use markdown::{Markdown, MarkdownElement};
 use multi_buffer::{Anchor, ExcerptId};
 use ordered_float::OrderedFloat;
-use project::lsp_store::CompletionDocumentation;
 use project::CompletionSource;
+use project::lsp_store::CompletionDocumentation;
 use project::{CodeAction, Completion, TaskSourceKind};
 
 use std::{
     cell::RefCell,
-    cmp::{min, Reverse},
+    cmp::{Reverse, min},
     iter,
     ops::Range,
     rc::Rc,
 };
 use task::ResolvedTask;
-use ui::{prelude::*, Color, IntoElement, ListItem, Pixels, Popover, Styled};
+use ui::{Color, IntoElement, ListItem, Pixels, Popover, Styled, prelude::*};
 use util::ResultExt;
 
 use crate::hover_popover::{hover_markdown_style, open_markdown_url};
 use crate::{
+    CodeActionProvider, CompletionId, CompletionItemKind, CompletionProvider, DisplayRow, Editor,
+    EditorStyle, ResolvedTasks,
     actions::{ConfirmCodeAction, ConfirmCompletion},
-    split_words, styled_runs_for_code_label, CodeActionProvider, CompletionId, CompletionProvider,
-    DisplayRow, Editor, EditorStyle, ResolvedTasks,
+    split_words, styled_runs_for_code_label,
 };
 
 pub const MENU_GAP: Pixels = px(4.);
@@ -124,16 +126,15 @@ impl CodeContextMenu {
         &self,
         style: &EditorStyle,
         max_height_in_lines: u32,
-        y_flipped: bool,
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> AnyElement {
         match self {
             CodeContextMenu::Completions(menu) => {
-                menu.render(style, max_height_in_lines, y_flipped, window, cx)
+                menu.render(style, max_height_in_lines, window, cx)
             }
             CodeContextMenu::CodeActions(menu) => {
-                menu.render(style, max_height_in_lines, y_flipped, window, cx)
+                menu.render(style, max_height_in_lines, window, cx)
             }
         }
     }
@@ -180,6 +181,7 @@ pub struct CompletionsMenu {
     scroll_handle: UniformListScrollHandle,
     resolve_completions: bool,
     show_completion_documentation: bool,
+    pub(super) ignore_completion_provider: bool,
     last_rendered_range: Rc<RefCell<Option<Range<usize>>>>,
     markdown_element: Option<Entity<Markdown>>,
 }
@@ -189,6 +191,7 @@ impl CompletionsMenu {
         id: CompletionId,
         sort_completions: bool,
         show_completion_documentation: bool,
+        ignore_completion_provider: bool,
         initial_position: Anchor,
         buffer: Entity<Buffer>,
         completions: Box<[Completion]>,
@@ -205,6 +208,7 @@ impl CompletionsMenu {
             initial_position,
             buffer,
             show_completion_documentation,
+            ignore_completion_provider,
             completions: RefCell::new(completions).into(),
             match_candidates,
             entries: RefCell::new(Vec::new()).into(),
@@ -226,15 +230,17 @@ impl CompletionsMenu {
         let completions = choices
             .iter()
             .map(|choice| Completion {
-                old_range: selection.start.text_anchor..selection.end.text_anchor,
+                replace_range: selection.start.text_anchor..selection.end.text_anchor,
                 new_text: choice.to_string(),
                 label: CodeLabel {
                     text: choice.to_string(),
                     runs: Default::default(),
                     filter_range: Default::default(),
                 },
+                icon_path: None,
                 documentation: None,
                 confirm: None,
+                insert_text_mode: None,
                 source: CompletionSource::Custom,
             })
             .collect();
@@ -266,6 +272,7 @@ impl CompletionsMenu {
             scroll_handle: UniformListScrollHandle::new(),
             resolve_completions: false,
             show_completion_documentation: false,
+            ignore_completion_provider: false,
             last_rendered_range: RefCell::new(None).into(),
             markdown_element: None,
         }
@@ -412,9 +419,9 @@ impl CompletionsMenu {
             cx,
         );
 
-        cx.spawn(move |editor, mut cx| async move {
+        cx.spawn(async move |editor, cx| {
             if let Some(true) = resolve_task.await.log_err() {
-                editor.update(&mut cx, |_, cx| cx.notify()).ok();
+                editor.update(cx, |_, cx| cx.notify()).ok();
             }
         })
         .detach();
@@ -432,7 +439,6 @@ impl CompletionsMenu {
         &self,
         style: &EditorStyle,
         max_height_in_lines: u32,
-        y_flipped: bool,
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> AnyElement {
@@ -535,9 +541,25 @@ impl CompletionsMenu {
                         } else {
                             None
                         };
-                        let color_swatch = completion
+
+                        let start_slot = completion
                             .color()
-                            .map(|color| div().size_4().bg(color).rounded_xs());
+                            .map(|color| {
+                                div()
+                                    .flex_shrink_0()
+                                    .size_3p5()
+                                    .rounded_xs()
+                                    .bg(color)
+                                    .into_any_element()
+                            })
+                            .or_else(|| {
+                                completion.icon_path.as_ref().map(|path| {
+                                    Icon::from_path(path)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted)
+                                        .into_any_element()
+                                })
+                            });
 
                         div().min_w(px(280.)).max_w(px(540.)).child(
                             ListItem::new(mat.candidate_id)
@@ -555,7 +577,7 @@ impl CompletionsMenu {
                                         task.detach_and_log_err(cx)
                                     }
                                 }))
-                                .start_slot::<Div>(color_swatch)
+                                .start_slot::<AnyElement>(start_slot)
                                 .child(h_flex().overflow_hidden().child(completion_label))
                                 .end_slot::<Label>(documentation_label),
                         )
@@ -566,7 +588,6 @@ impl CompletionsMenu {
         .occlude()
         .max_h(max_height_in_lines as f32 * window.line_height())
         .track_scroll(self.scroll_handle.clone())
-        .y_flipped(y_flipped)
         .with_width_from_item(widest_completion_ix)
         .with_sizing_behavior(ListSizingBehavior::Infer);
 
@@ -601,21 +622,20 @@ impl CompletionsMenu {
                         let language = editor
                             .language_at(self.initial_position, cx)
                             .map(|l| l.name().to_proto());
-                        Markdown::new(
-                            SharedString::default(),
-                            hover_markdown_style(window, cx),
-                            languages,
-                            language,
-                            cx,
-                        )
-                        .copy_code_block_buttons(false)
-                        .open_url(open_markdown_url)
+                        Markdown::new(SharedString::default(), languages, language, cx)
                     })
                 });
                 markdown.update(cx, |markdown, cx| {
                     markdown.reset(parsed.clone(), cx);
                 });
-                div().child(markdown.clone())
+                div().child(
+                    MarkdownElement::new(markdown.clone(), hover_markdown_style(window, cx))
+                        .code_block_renderer(markdown::CodeBlockRenderer::Default {
+                            copy_button: false,
+                            border: false,
+                        })
+                        .on_url_click(open_markdown_url),
+                )
             }
             CompletionDocumentation::MultiLineMarkdown(_) => return None,
             CompletionDocumentation::SingleLine(_) => return None,
@@ -635,6 +655,63 @@ impl CompletionsMenu {
                 )
                 .into_any_element(),
         )
+    }
+
+    pub fn sort_matches(matches: &mut Vec<SortableMatch<'_>>, query: Option<&str>) {
+        #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+        enum MatchTier<'a> {
+            WordStartMatch {
+                sort_score_int: Reverse<i32>,
+                sort_snippet: Reverse<i32>,
+                sort_text: Option<&'a str>,
+                sort_key: (usize, &'a str),
+            },
+            OtherMatch {
+                sort_score: Reverse<OrderedFloat<f64>>,
+            },
+        }
+
+        // Our goal here is to intelligently sort completion suggestions. We want to
+        // balance the raw fuzzy match score with hints from the language server
+        //
+        // We first primary sort using fuzzy score by putting matches into two buckets
+        // strong one and weak one. Among these buckets matches are then compared by
+        // various criteria like snippet, LSP hints, kind, label text etc.
+        //
+        const FUZZY_THRESHOLD: f64 = 0.1317;
+
+        let query_start_lower = query
+            .and_then(|q| q.chars().next())
+            .and_then(|c| c.to_lowercase().next());
+
+        matches.sort_unstable_by_key(|mat| {
+            let score = mat.string_match.score;
+
+            let is_other_match = query_start_lower
+                .map(|query_char| {
+                    !split_words(&mat.string_match.string).any(|word| {
+                        word.chars()
+                            .next()
+                            .and_then(|c| c.to_lowercase().next())
+                            .map_or(false, |word_char| word_char == query_char)
+                    })
+                })
+                .unwrap_or(false);
+
+            if is_other_match {
+                let sort_score = Reverse(OrderedFloat(score));
+                MatchTier::OtherMatch { sort_score }
+            } else {
+                let sort_score_int = Reverse(if score >= FUZZY_THRESHOLD { 1 } else { 0 });
+                let sort_snippet = Reverse(if mat.is_snippet { 1 } else { 0 });
+                MatchTier::WordStartMatch {
+                    sort_score_int,
+                    sort_snippet,
+                    sort_text: mat.sort_text,
+                    sort_key: mat.sort_key,
+                }
+            }
+        });
     }
 
     pub async fn filter(&mut self, query: Option<&str>, executor: BackgroundExecutor) {
@@ -661,86 +738,59 @@ impl CompletionsMenu {
                 .collect()
         };
 
-        // Remove all candidates where the query's start does not match the start of any word in the candidate
-        if let Some(query) = query {
-            if let Some(query_start) = query.chars().next() {
-                matches.retain(|string_match| {
-                    split_words(&string_match.string).any(|word| {
-                        // Check that the first codepoint of the word as lowercase matches the first
-                        // codepoint of the query as lowercase
-                        word.chars()
-                            .flat_map(|codepoint| codepoint.to_lowercase())
-                            .zip(query_start.to_lowercase())
-                            .all(|(word_cp, query_cp)| word_cp == query_cp)
-                    })
-                });
-            }
-        }
-
-        let completions = self.completions.borrow_mut();
         if self.sort_completions {
-            matches.sort_unstable_by_key(|mat| {
-                // We do want to strike a balance here between what the language server tells us
-                // to sort by (the sort_text) and what are "obvious" good matches (i.e. when you type
-                // `Creat` and there is a local variable called `CreateComponent`).
-                // So what we do is: we bucket all matches into two buckets
-                // - Strong matches
-                // - Weak matches
-                // Strong matches are the ones with a high fuzzy-matcher score (the "obvious" matches)
-                // and the Weak matches are the rest.
-                //
-                // For the strong matches, we sort by our fuzzy-finder score first and for the weak
-                // matches, we prefer language-server sort_text first.
-                //
-                // The thinking behind that: we want to show strong matches first in order of relevance(fuzzy score).
-                // Rest of the matches(weak) can be sorted as language-server expects.
+            let completions = self.completions.borrow();
 
-                #[derive(PartialEq, Eq, PartialOrd, Ord)]
-                enum MatchScore<'a> {
-                    Strong {
-                        score: Reverse<OrderedFloat<f64>>,
-                        sort_text: Option<&'a str>,
-                        sort_key: (usize, &'a str),
-                    },
-                    Weak {
-                        sort_text: Option<&'a str>,
-                        score: Reverse<OrderedFloat<f64>>,
-                        sort_key: (usize, &'a str),
-                    },
-                }
+            let mut sortable_items: Vec<SortableMatch<'_>> = matches
+                .into_iter()
+                .map(|string_match| {
+                    let completion = &completions[string_match.candidate_id];
 
-                let completion = &completions[mat.candidate_id];
-                let sort_key = completion.sort_key();
-                let sort_text =
-                    if let CompletionSource::Lsp { lsp_completion, .. } = &completion.source {
-                        lsp_completion.sort_text.as_deref()
-                    } else {
-                        None
-                    };
-                let score = Reverse(OrderedFloat(mat.score));
+                    let is_snippet = matches!(
+                        &completion.source,
+                        CompletionSource::Lsp { lsp_completion, .. }
+                        if lsp_completion.kind == Some(CompletionItemKind::SNIPPET)
+                    );
 
-                if mat.score >= 0.2 {
-                    MatchScore::Strong {
-                        score,
+                    let sort_text =
+                        if let CompletionSource::Lsp { lsp_completion, .. } = &completion.source {
+                            lsp_completion.sort_text.as_deref()
+                        } else {
+                            None
+                        };
+
+                    let sort_key = completion.sort_key();
+
+                    SortableMatch {
+                        string_match,
+                        is_snippet,
                         sort_text,
                         sort_key,
                     }
-                } else {
-                    MatchScore::Weak {
-                        sort_text,
-                        score,
-                        sort_key,
-                    }
-                }
-            });
+                })
+                .collect();
+
+            Self::sort_matches(&mut sortable_items, query);
+
+            matches = sortable_items
+                .into_iter()
+                .map(|sortable| sortable.string_match)
+                .collect();
         }
-        drop(completions);
 
         *self.entries.borrow_mut() = matches;
         self.selected_item = 0;
         // This keeps the display consistent when y_flipped.
         self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
     }
+}
+
+#[derive(Debug)]
+pub struct SortableMatch<'a> {
+    pub string_match: StringMatch,
+    pub is_snippet: bool,
+    pub sort_text: Option<&'a str>,
+    pub sort_key: (usize, &'a str),
 }
 
 #[derive(Clone)]
@@ -752,11 +802,34 @@ pub struct AvailableCodeAction {
 
 #[derive(Clone)]
 pub struct CodeActionContents {
-    pub tasks: Option<Rc<ResolvedTasks>>,
-    pub actions: Option<Rc<[AvailableCodeAction]>>,
+    tasks: Option<Rc<ResolvedTasks>>,
+    actions: Option<Rc<[AvailableCodeAction]>>,
 }
 
 impl CodeActionContents {
+    pub fn new(
+        mut tasks: Option<ResolvedTasks>,
+        actions: Option<Rc<[AvailableCodeAction]>>,
+        cx: &App,
+    ) -> Self {
+        if !cx.has_flag::<Debugger>() {
+            if let Some(tasks) = &mut tasks {
+                tasks
+                    .templates
+                    .retain(|(_, task)| !matches!(task.task_type(), task::TaskType::Debug(_)));
+            }
+        }
+
+        Self {
+            tasks: tasks.map(Rc::new),
+            actions,
+        }
+    }
+
+    pub fn tasks(&self) -> Option<&ResolvedTasks> {
+        self.tasks.as_deref()
+    }
+
     fn len(&self) -> usize {
         match (&self.tasks, &self.actions) {
             (Some(tasks), Some(actions)) => actions.len() + tasks.templates.len(),
@@ -950,7 +1023,6 @@ impl CodeActionsMenu {
         &self,
         _style: &EditorStyle,
         max_height_in_lines: u32,
-        y_flipped: bool,
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> AnyElement {
@@ -1029,7 +1101,6 @@ impl CodeActionsMenu {
         .occlude()
         .max_h(max_height_in_lines as f32 * window.line_height())
         .track_scroll(self.scroll_handle.clone())
-        .y_flipped(y_flipped)
         .with_width_from_item(
             self.actions
                 .iter()
